@@ -33,8 +33,14 @@
 #include <limits>
 
 #include <SDL.h>          // RT64 default presenter (#58): real window + event pump under WSLg
-#if defined(_WIN32)
-#include <SDL_syswm.h>    // native Windows (#68): unwrap the HWND for ultramodern/RT64-D3D12
+#if defined(_WIN32) || defined(__APPLE__)
+// native Windows (#68): unwrap the HWND for ultramodern/RT64-D3D12.
+// macOS: unwrap the NSWindow* for ultramodern/RT64-Metal (see create_window_stub).
+#include <SDL_syswm.h>
+#endif
+#if defined(__APPLE__)
+#include <SDL_metal.h>    // SDL_Metal_CreateView / SDL_Metal_GetLayer -> CAMetalLayer*
+#include <mach-o/dyld.h>  // _NSGetExecutablePath (app-bundle detection in main)
 #endif
 #include "lambo_rt64.h"
 #include "lambo_audio.h"
@@ -369,6 +375,11 @@ static ultramodern::renderer::WindowHandle create_window_stub(void* /*gfx_data*/
         uint32_t flags = SDL_WINDOW_RESIZABLE;
 #if defined(__linux__)
         flags |= SDL_WINDOW_VULKAN;
+#elif defined(__APPLE__)
+        // macOS: RT64/plume use the Metal backend (this file's CMakeLists excludes APPLE
+        // from PLUME_SDL_VULKAN_ENABLED), so the window must be Metal-capable for the
+        // SDL_Metal_CreateView call in the __APPLE__ branch below.
+        flags |= SDL_WINDOW_METAL;
 #endif
         // Window size + startup fullscreen come from graphics.json (loaded in main()
         // before recomp::start). Fullscreen is owned by SDL on this (main) thread --
@@ -408,6 +419,30 @@ static ultramodern::renderer::WindowHandle create_window_stub(void* /*gfx_data*/
         LAMBO_LOG("rt64", "SDL window created (%dx%d, Win32 HWND -> D3D12)\n",
                      win_size.width, win_size.height);
         return ultramodern::renderer::WindowHandle{wmInfo.info.win.window, GetCurrentThreadId()};
+#elif defined(__APPLE__)
+        // macOS: ultramodern's WindowHandle is { void* window; void* view; } and BOTH are
+        // consumed as Objective-C/Metal objects: plume::CocoaWindow sends -contentView to
+        // .window (plume_apple.mm), and plume's Metal backend casts .view straight to
+        // CA::MetalLayer* (plume_metal.cpp). So .window must be the NSWindow* and .view the
+        // CAMetalLayer* -- SDL hands us both. (Passing the SDL_Window*, as the Linux branch
+        // above does, is only valid there, where WindowHandle IS an SDL_Window*.)
+        SDL_SysWMinfo wmInfoMac;
+        SDL_VERSION(&wmInfoMac.version);
+        if (SDL_GetWindowWMInfo(window, &wmInfoMac) != SDL_TRUE) {
+            LAMBO_LOG("rt64", "SDL_GetWindowWMInfo failed: %s -- staying headless\n", SDL_GetError());
+            SDL_DestroyWindow(window);
+            return ultramodern::renderer::WindowHandle{};
+        }
+        SDL_MetalView metal_view = SDL_Metal_CreateView(window);
+        if (metal_view == nullptr) {
+            LAMBO_LOG("rt64", "SDL_Metal_CreateView failed: %s -- staying headless\n", SDL_GetError());
+            SDL_DestroyWindow(window);
+            return ultramodern::renderer::WindowHandle{};
+        }
+        LAMBO_LOG("rt64", "SDL window created (%dx%d, NSWindow + CAMetalLayer -> Metal)\n",
+                     win_size.width, win_size.height);
+        return ultramodern::renderer::WindowHandle{wmInfoMac.info.cocoa.window,
+                                                  SDL_Metal_GetLayer(metal_view)};
 #else
         LAMBO_LOG("rt64", "window handle wiring not implemented on this platform\n");
         SDL_DestroyWindow(window);
@@ -686,6 +721,41 @@ static ultramodern::input::connected_device_info_t input_device_info(int control
     return { Device::None, Pak::None };
 }
 
+#if defined(__APPLE__)
+// A Finder-launched .app starts with the working directory set to "/", but three lookups
+// here are relative to it: the default ROM name below, lamborghini.syms.toml
+// (lambo_crash.cpp), and the controller-pak file (libultra_stubs.c:160). Point the working
+// directory at a writable per-user location so the pak persists across runs, and hand back
+// the bundled ROM so the default path still resolves. Assets need no help: asset_root()
+// already falls back to SDL_GetBasePath(), which is Contents/Resources inside a bundle.
+//
+// Returns an empty path when not running from a bundle, leaving plain builds untouched.
+static std::filesystem::path macos_prepare_bundle_environment() {
+    uint32_t bufsize = 0;
+    _NSGetExecutablePath(nullptr, &bufsize);   // null buffer -> report required size
+    if (bufsize == 0) return {};
+    std::string buf(bufsize, '\0');
+    if (_NSGetExecutablePath(buf.data(), &bufsize) != 0) return {};
+
+    std::error_code ec;
+    std::filesystem::path self = std::filesystem::canonical(buf.c_str(), ec);
+    if (ec) self = std::filesystem::path(buf.c_str());
+
+    const std::filesystem::path macos_dir = self.parent_path();          // Contents/MacOS
+    if (macos_dir.filename() != "MacOS") return {};                      // not bundled
+    const std::filesystem::path resources = macos_dir.parent_path() / "Resources";
+    if (!std::filesystem::exists(resources, ec)) return {};
+
+    if (const char* home = std::getenv("HOME")) {
+        const std::filesystem::path data_dir = std::filesystem::path(home) /
+            "Library" / "Application Support" / "AutomobiliLamborghini";
+        std::filesystem::create_directories(data_dir, ec);
+        if (!ec) std::filesystem::current_path(data_dir, ec);
+    }
+    return resources / "Automobili Lamborghini (USA).z64";
+}
+#endif
+
 int main(int argc, char** argv) {
     // Deterministic lighting self-test: no ROM, no runtime -- exercises the swrender
     // light-decode + lambert path on a synthetic DL and exits (tests/pivot/test_lighting.py).
@@ -699,6 +769,12 @@ int main(int argc, char** argv) {
     // start with "--" so e.g. `lamborghini_modern --lambo-debug` still finds the
     // bundled ROM at argv[2] (or falls back to the default when no path given).
     const char* rom_path = "Automobili Lamborghini (USA).z64";
+#if defined(__APPLE__)
+    // Before the crash handler and config load, which both resolve against the cwd.
+    // A positional argv path still wins -- the scan below overwrites this default.
+    static const std::string bundled_rom = macos_prepare_bundle_environment().string();
+    if (!bundled_rom.empty()) rom_path = bundled_rom.c_str();
+#endif
     for (int i = 1; i < argc; ++i) {
         if (argv[i] && argv[i][0] != '-' && argv[i][0] != '\0') {
             rom_path = argv[i];

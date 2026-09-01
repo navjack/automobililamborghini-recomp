@@ -274,6 +274,19 @@ foreach(_rmlui_target rmlui_core rmlui_debugger)
     endif()
 endforeach()
 
+# macOS: rt64 forces hlslpp's scalar path on Apple Silicon (lib/rt64/src/common/rt64_hlslpp.h:
+# "Disable SIMD on Apple Silicon due to UB when compiling with optimizations"). That path
+# calls labs() without including <stdlib.h>, and current SDK/libc++ headers no longer pull it
+# in transitively, so rt64_projection.cpp fails to compile. Force-include it for everything
+# built from here down (rt64 is added as a subdirectory below).
+if(APPLE)
+    # "SHELL:" keeps the two tokens together and exempt from CMake's option de-duplication.
+    # Without it, this "-include" and the "-include cstdint" added for RmlUi below collapse
+    # to a single "-include stdlib.h cstdint", and clang then treats cstdint as an input
+    # file ("no such file or directory: 'cstdint'").
+    add_compile_options("SHELL:-include stdlib.h")
+endif()
+
 set(RT64_STATIC TRUE)
 if(WIN32)
     # Windows (#68 native build): RT64 uses its D3D12 backend + a plain Win32 window
@@ -304,7 +317,12 @@ else()
     # rt64's vendored nativefiledialog-extended defaults to the GTK3 backend; this
     # box (WSL Ubuntu 24.04) has no libgtk-3-dev but does have dbus-1, so use the
     # xdg-desktop-portal backend instead.
-    set(NFD_PORTAL ON CACHE BOOL "" FORCE)
+    # NFD_PORTAL is the Linux xdg-desktop-portal backend for nativefiledialog-extended.
+    # macOS has its own Cocoa backend and must not use the portal one, so scope this to
+    # non-Apple. (The enclosing branch is "not Windows", which includes Apple.)
+    if(NOT APPLE)
+        set(NFD_PORTAL ON CACHE BOOL "" FORCE)
+    endif()
 endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/lib/rt64 ${CMAKE_BINARY_DIR}/rt64)
 # Generated shader headers land in the rt64 binary dir (Zelda64Recomp does the same).

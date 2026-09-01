@@ -72,3 +72,6 @@ nextsessionprompt.md
 verify_*/
 # Host-compiled unit-test binaries
 tests/*.exe
+
+# --- macOS port: build artifacts, ROMs and local machine state ---
+*.app/

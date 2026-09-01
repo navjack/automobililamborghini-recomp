@@ -1,9 +1,11 @@
 [submodule "lib/N64ModernRuntime"]
 	path = lib/N64ModernRuntime
-	url = https://github.com/N64Recomp/N64ModernRuntime.git
+	url = https://github.com/navjack/N64ModernRuntime.git
+	branch = macos-port-automobili
 [submodule "lib/rt64"]
 	path = lib/rt64
-	url = https://github.com/rt64/rt64.git
+	url = https://github.com/navjack/rt64.git
+	branch = macos-port-automobili
 
 [submodule "lib/RmlUi"]
 	path = lib/RmlUi

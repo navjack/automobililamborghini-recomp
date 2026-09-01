@@ -24,6 +24,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>  // _NSGetExecutablePath: macOS has no /proc/self/exe
+#endif
+
 #include "librecomp/sections.h"
 #include "recomp.h"
 
@@ -181,11 +185,40 @@ void find_and_load_symbol_table() {
         candidates.emplace_back(exedir / "lamborghini.syms.toml");
         candidates.emplace_back(exedir.parent_path() / "lamborghini.syms.toml");
     }
+#elif defined(__APPLE__)
+    {
+        // macOS has no /proc, so read_symlink("/proc/self/exe") throws an uncaught
+        // filesystem_error and kills the process at startup. _NSGetExecutablePath is the
+        // supported equivalent: call once with a null buffer to learn the size, then again
+        // to fill it. The result may contain symlinks/".."; canonical() tidies it, and we
+        // fall back to the raw path if that fails (e.g. inside an app bundle).
+        uint32_t bufsize = 0;
+        _NSGetExecutablePath(nullptr, &bufsize);
+        if (bufsize > 0) {
+            std::string exe_buf(bufsize, '\0');
+            if (_NSGetExecutablePath(exe_buf.data(), &bufsize) == 0) {
+                std::error_code ec;
+                std::filesystem::path self = std::filesystem::canonical(exe_buf.c_str(), ec);
+                if (ec) self = std::filesystem::path(exe_buf.c_str());
+                candidates.emplace_back(self.parent_path() / "lamborghini.syms.toml");
+                candidates.emplace_back(self.parent_path().parent_path() / "lamborghini.syms.toml");
+                // Inside a .app the table ships in Contents/Resources: codesign treats a
+                // non-Mach-O file in Contents/MacOS as an unsigned nested component and
+                // refuses to seal the bundle, so it cannot sit next to the executable.
+                candidates.emplace_back(self.parent_path().parent_path() / "Resources" / "lamborghini.syms.toml");
+            }
+        }
+    }
 #else
     {
-        std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe");
-        candidates.emplace_back(self.parent_path() / "lamborghini.syms.toml");
-        candidates.emplace_back(self.parent_path().parent_path() / "lamborghini.syms.toml");
+        // Non-throwing overload: a missing /proc must not abort startup (see the macOS
+        // branch above for how that failed).
+        std::error_code ec;
+        std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            candidates.emplace_back(self.parent_path() / "lamborghini.syms.toml");
+            candidates.emplace_back(self.parent_path().parent_path() / "lamborghini.syms.toml");
+        }
     }
 #endif
     for (const auto& p : candidates) {
